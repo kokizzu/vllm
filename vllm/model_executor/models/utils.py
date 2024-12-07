@@ -1,7 +1,7 @@
 import itertools
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterable, List, Literal, Mapping,
-                    Optional, Protocol, Set, Tuple, Union, overload)
+from typing import (Callable, Dict, Iterable, List, Literal, Mapping, Optional,
+                    Protocol, Set, Tuple, Union, overload)
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
 from vllm.platforms import _Backend, current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils import is_pin_memory_available
+from vllm.utils import is_pin_memory_available, print_warning_once
 
 logger = init_logger(__name__)
 
@@ -173,8 +173,15 @@ class AutoWeightsLoader:
             module_load_weights = getattr(module, "load_weights", None)
             if callable(module_load_weights):
                 loaded_params = module_load_weights(weights)
-                yield from map(lambda x: self._get_qualname(base_prefix, x),
-                               loaded_params)
+                if loaded_params is None:
+                    logger.warning(
+                        "Unable to collect loaded parameters "
+                        "for module %s", module)
+                else:
+                    yield from map(
+                        lambda x: self._get_qualname(base_prefix, x),
+                        loaded_params,
+                    )
 
         child_modules = dict(module.named_children())
         child_params = dict(module.named_parameters(recurse=False))
@@ -232,17 +239,27 @@ class AutoWeightsLoader:
 
 
 def init_vllm_registered_model(
-    hf_config: PretrainedConfig,
     vllm_config: VllmConfig,
+    *,
     prefix: str = "",
+    hf_config: Optional[PretrainedConfig] = None,
+    architectures: Optional[list[str]] = None,
 ) -> nn.Module:
     """
     Helper function to initialize an inner model registered to vLLM,
     based on the arguments passed to the outer vLLM model.
     """
     from vllm.model_executor.model_loader.loader import _initialize_model
-    vllm_config = vllm_config.with_hf_config(hf_config)
-    return _initialize_model(vllm_config, prefix)
+
+    if hf_config is None and architectures is not None:
+        # So that the architectures field is overridden
+        hf_config = vllm_config.model_config.hf_config
+
+    if hf_config is not None:
+        vllm_config = vllm_config.with_hf_config(hf_config,
+                                                 architectures=architectures)
+
+    return _initialize_model(vllm_config=vllm_config, prefix=prefix)
 
 
 @overload
@@ -560,30 +577,6 @@ def make_empty_intermediate_tensors_factory(keys: List[str], hidden_size: int):
     return make_empty_intermediate_tensors
 
 
-class LLMWrapper(nn.Module):
-    """
-    To align with the key names of LoRA trained with PEFT, we need to add an
-    additional layer to the llm's implementation.
-    """
-
-    def __init__(self, llm: nn.Module, name: str) -> None:
-        super().__init__()
-        self.model_name = name
-        setattr(self, name, llm)
-
-    def __getattr__(self, key: str):
-        llm = super().__getattr__(self.model_name)
-        if key == self.model_name:
-            return llm
-
-        return getattr(llm, key)
-
-    # We need to explicitly override this
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        llm = super().__getattr__(self.model_name)
-        return llm(*args, **kwargs)
-
-
 def get_vit_attn_backend(support_fa: bool = False) -> _Backend:
     """
     Get the available attention backend for Vision Transformer.
@@ -602,7 +595,7 @@ def get_vit_attn_backend(support_fa: bool = False) -> _Backend:
             if is_flash_attn_2_available():
                 selected_backend = _Backend.FLASH_ATTN
             else:
-                logger.warning(
+                print_warning_once(
                     "Current `vllm-flash-attn` has a bug inside vision module, "
                     "so we use xformers backend instead. You can run "
                     "`pip install flash-attn` to use flash-attention backend.")
