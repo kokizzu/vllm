@@ -9,10 +9,10 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
-                         DecodingConfig, DeviceConfig, HfOverrides, LoadConfig,
-                         LoadFormat, LoRAConfig, ModelConfig,
-                         ObservabilityConfig, ParallelConfig, PoolerConfig,
-                         PromptAdapterConfig, SchedulerConfig,
+                         DecodingConfig, DeviceConfig, HfOverrides,
+                         KVTransferConfig, LoadConfig, LoadFormat, LoRAConfig,
+                         ModelConfig, ObservabilityConfig, ParallelConfig,
+                         PoolerConfig, PromptAdapterConfig, SchedulerConfig,
                          SpeculativeConfig, TaskOption, TokenizerPoolConfig,
                          VllmConfig)
 from vllm.executor.executor_base import ExecutorBase
@@ -108,6 +108,7 @@ class EngineArgs:
     # notice.
     distributed_executor_backend: Optional[Union[str,
                                                  Type[ExecutorBase]]] = None
+    # number of P/D disaggregation (or other disaggregation) workers
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
@@ -121,7 +122,7 @@ class EngineArgs:
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: Optional[int] = None
-    max_num_seqs: int = 256
+    max_num_seqs: Optional[int] = None
     max_logprobs: int = 20  # Default value for OpenAI Chat Completions API
     disable_log_stats: bool = False
     revision: Optional[str] = None
@@ -167,7 +168,7 @@ class EngineArgs:
     scheduler_delay_factor: float = 0.0
     enable_chunked_prefill: Optional[bool] = None
 
-    guided_decoding_backend: str = 'outlines'
+    guided_decoding_backend: str = 'xgrammar'
     # Speculative decoding configuration.
     speculative_model: Optional[str] = None
     speculative_model_quantization: Optional[str] = None
@@ -194,6 +195,8 @@ class EngineArgs:
     compilation_config: Optional[CompilationConfig] = None
     worker_cls: str = "auto"
 
+    kv_transfer_config: Optional[KVTransferConfig] = None
+
     def __post_init__(self):
         if not self.tokenizer:
             self.tokenizer = self.model
@@ -202,16 +205,16 @@ class EngineArgs:
         # by user.
         if self.enable_prefix_caching is None:
             self.enable_prefix_caching = bool(envs.VLLM_USE_V1)
+        # Override max_num_seqs if it's not set by user.
+        if self.max_num_seqs is None:
+            self.max_num_seqs = 256 if not envs.VLLM_USE_V1 else 1024
 
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
-        if isinstance(self.compilation_config, (int)):
+        if isinstance(self.compilation_config, (int, dict)):
             self.compilation_config = CompilationConfig.from_cli(
                 str(self.compilation_config))
-        elif isinstance(self.compilation_config, (dict)):
-            self.compilation_config = CompilationConfig.from_cli(
-                json.dumps(self.compilation_config))
 
         # Setup plugins
         from vllm.plugins import load_general_plugins
@@ -361,11 +364,12 @@ class EngineArgs:
         parser.add_argument(
             '--guided-decoding-backend',
             type=str,
-            default='outlines',
-            choices=['outlines', 'lm-format-enforcer'],
+            default='xgrammar',
+            choices=['outlines', 'lm-format-enforcer', 'xgrammar'],
             help='Which engine will be used for guided decoding'
             ' (JSON schema / regex etc) by default. Currently support '
-            'https://github.com/outlines-dev/outlines and '
+            'https://github.com/outlines-dev/outlines,'
+            'https://github.com/mlc-ai/xgrammar, and '
             'https://github.com/noamgat/lm-format-enforcer.'
             ' Can be overridden per request via guided_decoding_backend'
             ' parameter.')
@@ -416,15 +420,20 @@ class EngineArgs:
                             'tokens. This is ignored on neuron devices and '
                             'set to max-model-len')
 
-        parser.add_argument('--enable-prefix-caching',
-                            action='store_true',
-                            help='Enables automatic prefix caching.')
+        parser.add_argument(
+            "--enable-prefix-caching",
+            action=argparse.BooleanOptionalAction,
+            default=EngineArgs.enable_prefix_caching,
+            help="Enables automatic prefix caching. "
+            "Use --no-enable-prefix-caching to disable explicitly.",
+        )
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
                             help='Disables sliding window, '
                             'capping to sliding window size')
         parser.add_argument('--use-v2-block-manager',
                             action='store_true',
+                            default=True,
                             help='[DEPRECATED] block manager v1 has been '
                             'removed and SelfAttnBlockSpaceManager (i.e. '
                             'block manager v2) is now the default. '
@@ -904,6 +913,12 @@ class EngineArgs:
                             'compilers, using -O without space is also '
                             'supported. -O3 is equivalent to -O 3.')
 
+        parser.add_argument('--kv-transfer-config',
+                            type=KVTransferConfig.from_cli,
+                            default=None,
+                            help='The configurations for distributed KV cache '
+                            'transfer. Should be a JSON string.')
+
         parser.add_argument(
             '--worker-cls',
             type=str,
@@ -1038,9 +1053,12 @@ class EngineArgs:
             # long context (> 32K) models. This is to avoid OOM errors in the
             # initial memory profiling phase.
 
-            # Chunked prefill is currently disabled for multimodal models by
-            # default.
-            if use_long_context and not model_config.is_multimodal_model:
+            # For multimodal models, chunked prefill is disabled by default in
+            # V0, but enabled by design in V1
+            if model_config.is_multimodal_model:
+                self.enable_chunked_prefill = bool(envs.VLLM_USE_V1)
+
+            elif use_long_context:
                 is_gpu = device_config.device_type == "cuda"
                 use_sliding_window = (model_config.get_sliding_window()
                                       is not None)
@@ -1048,7 +1066,7 @@ class EngineArgs:
                 if (is_gpu and not use_sliding_window and not use_spec_decode
                         and not self.enable_lora
                         and not self.enable_prompt_adapter
-                        and model_config.task != "embedding"):
+                        and model_config.runner_type != "pooling"):
                     self.enable_chunked_prefill = True
                     logger.warning(
                         "Chunked prefill is enabled by default for models with "
@@ -1065,7 +1083,8 @@ class EngineArgs:
                 "errors during the initial memory profiling phase, or result "
                 "in low performance due to small KV cache space. Consider "
                 "setting --max-model-len to a smaller value.", max_model_len)
-        elif self.enable_chunked_prefill and model_config.task == "embedding":
+        elif (self.enable_chunked_prefill
+              and model_config.runner_type == "pooling"):
             msg = "Chunked prefill is not supported for embedding models"
             raise ValueError(msg)
 
@@ -1097,7 +1116,7 @@ class EngineArgs:
             disable_logprobs=self.disable_logprobs_during_spec_decoding,
         )
 
-        # Reminder: Please update docs/source/serving/compatibility_matrix.rst
+        # Reminder: Please update docs/source/usage/compatibility_matrix.rst
         # If the feature combo become valid
         if self.num_scheduler_steps > 1:
             if speculative_config is not None:
@@ -1126,7 +1145,7 @@ class EngineArgs:
                 " please file an issue with detailed information.")
 
         scheduler_config = SchedulerConfig(
-            task=model_config.task,
+            runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_num_seqs=self.max_num_seqs,
             max_model_len=model_config.max_model_len,
@@ -1197,6 +1216,7 @@ class EngineArgs:
             observability_config=observability_config,
             prompt_adapter_config=prompt_adapter_config,
             compilation_config=self.compilation_config,
+            kv_transfer_config=self.kv_transfer_config,
         )
 
         if envs.VLLM_USE_V1:
@@ -1209,31 +1229,28 @@ class EngineArgs:
         """
         assert envs.VLLM_USE_V1, "V1 is not enabled"
 
+        # V1 always uses chunked prefills.
+        self.enable_chunked_prefill = True
+        # When no user override, set the default values based on the usage
+        # context.
+        # TODO(woosuk): Tune the default values for different hardware.
         if self.max_num_batched_tokens is None:
-            # When no user override, set the default values based on the
-            # usage context.
             if usage_context == UsageContext.LLM_CLASS:
-                logger.warning("Setting max_num_batched_tokens to 8192 "
-                               "for LLM_CLASS usage context.")
-                self.max_num_seqs = 1024
                 self.max_num_batched_tokens = 8192
             elif usage_context == UsageContext.OPENAI_API_SERVER:
-                logger.warning("Setting max_num_batched_tokens to 2048 "
-                               "for OPENAI_API_SERVER usage context.")
-                self.max_num_seqs = 1024
                 self.max_num_batched_tokens = 2048
+            logger.warning(
+                "Setting max_num_batched_tokens to %d for %s usage context.",
+                self.max_num_batched_tokens, usage_context.value)
 
     def _override_v1_engine_config(self, engine_config: VllmConfig) -> None:
         """
         Override the EngineConfig's configs based on the usage context for V1.
         """
         assert envs.VLLM_USE_V1, "V1 is not enabled"
-        # TODO (ywang96): Enable APC by default when VLM supports it.
         if engine_config.model_config.is_multimodal_model:
-            logger.warning(
-                "Prefix caching is currently not supported for multimodal "
-                "models and has been disabled.")
-            engine_config.cache_config.enable_prefix_caching = False
+            # TODO (ywang96): Enable APC by default when VLM supports it.
+            assert not engine_config.cache_config.enable_prefix_caching
 
 
 @dataclass
