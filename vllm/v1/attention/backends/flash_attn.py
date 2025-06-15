@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import numpy as np
 import torch
@@ -16,16 +16,17 @@ from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            get_flash_attn_version)
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.distributed.kv_transfer.kv_connector.utils import (
+    get_kv_connector_cache_layout)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import cdiv
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
+                                              CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.worker.gpu_input_batch import InputBatch
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 if current_platform.is_cuda():
@@ -69,6 +70,20 @@ class FlashAttentionBackend(AttentionBackend):
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @staticmethod
+    def get_kv_cache_stride_order() -> tuple[int, ...]:
+        # NOTE When running disaggregated PD with NIXL, HND layout is used for
+        # faster transfer. `stride_order` indicates the permutation that gets
+        # us from `get_kv_cache_shape` to the actual memory layout we want.
+        cache_layout = get_kv_connector_cache_layout()
+        if cache_layout == "NHD":
+            stride_order = (0, 1, 2, 3, 4)
+        elif cache_layout == "HND":
+            stride_order = (0, 1, 3, 2, 4)
+        else:
+            raise ValueError("Unknown cache layout format %s.", cache_layout)
+        return stride_order
 
 
 @dataclass
@@ -290,7 +305,9 @@ def _get_sliding_window_configs(
     return sliding_window_configs
 
 
-class FlashAttentionMetadataBuilder:
+class FlashAttentionMetadataBuilder(
+        AttentionMetadataBuilder[FlashAttentionMetadata]):
+    full_cudagraph_supported: ClassVar[bool] = get_flash_attn_version() == 3
 
     def __init__(self, runner: "GPUModelRunner", kv_cache_spec: AttentionSpec,
                  block_table: BlockTable):
@@ -307,26 +324,28 @@ class FlashAttentionMetadataBuilder:
         self.kv_cache_spec = kv_cache_spec
         self.block_table = block_table
 
-        if get_flash_attn_version() == 3:
-            self.aot_schedule = not compilation_config.full_cuda_graph
-            if not self.aot_schedule:
-                logger.warning(
-                    "AOT Schedule is disabled when using full_cuda_graph")
-        else:
-            self.aot_schedule = False
+        self.aot_schedule = (get_flash_attn_version() == 3)
+        self.use_full_cuda_graph = compilation_config.full_cuda_graph
+        if self.use_full_cuda_graph and not self.aot_schedule:
+            raise ValueError("Full CUDA graph mode requires AOT scheduling, "
+                             "which requires FlashAttention 3.")
+        self.scheduler_metadata = torch.zeros(self.runner.max_num_reqs + 1,
+                                              dtype=torch.int32,
+                                              device=self.runner.device)
 
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: Optional[tuple[int, int]] = None
 
-    def reorder_batch(self, input_batch: "InputBatch",
-                      scheduler_output: "SchedulerOutput") -> bool:
-        return False
+    def build(
+        self, common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata
+    ) -> FlashAttentionMetadata:
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        max_query_len = common_attn_metadata.max_query_len
 
-    def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
-              common_prefix_len: int,
-              common_attn_metadata: CommonAttentionMetadata):
-        max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
+        max_seq_len = int(self.runner.seq_lens_np[:num_reqs].max())
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = self.block_table
@@ -448,6 +467,18 @@ class FlashAttentionMetadataBuilder:
                                           max_seq_len=max_seq_len,
                                           causal=True)
 
+        if self.use_full_cuda_graph:
+            assert scheduler_metadata is not None
+            n = scheduler_metadata.shape[0]
+            self.scheduler_metadata[:n].copy_(scheduler_metadata,
+                                              non_blocking=True)
+            # NOTE(woosuk): We should zero out the rest of the scheduler
+            # metadata to guarantee the correctness. Otherwise, some thread
+            # blocks may use the invalid scheduler metadata and overwrite the
+            # output buffer.
+            self.scheduler_metadata[n:] = 0
+            scheduler_metadata = self.scheduler_metadata[:n]
+
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -466,6 +497,11 @@ class FlashAttentionMetadataBuilder:
             prefix_scheduler_metadata=prefix_scheduler_metadata,
         )
         return attn_metadata
+
+    def can_run_in_cudagraph(
+            self, common_attn_metadata: CommonAttentionMetadata) -> bool:
+        # Full CUDA Graph always supported (FA2 support checked separately)
+        return True
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         return use_cascade_attention(*args, **kwargs)
@@ -540,6 +576,7 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -556,6 +593,11 @@ class FlashAttentionImpl(AttentionImpl):
               We use torch's .expand() to avoid duplicating values
         """
         assert output is not None, "Output tensor must be provided."
+
+        if output_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not yet supported"
+                " for FlashAttentionImpl")
 
         if attn_metadata is None:
             # Profiling run.
