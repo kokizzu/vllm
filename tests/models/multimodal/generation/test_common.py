@@ -107,6 +107,8 @@ VLM_TEST_SETTINGS = {
             ),
             limit_mm_per_prompt={"image": 4},
         )],
+        # TODO: Revert to "auto" when CPU backend can use torch > 2.6
+        dtype="bfloat16" if current_platform.is_cpu() else "auto",
         marks=[pytest.mark.core_model, pytest.mark.cpu_model],
     ),
     "paligemma": VLMTestInfo(
@@ -226,6 +228,8 @@ VLM_TEST_SETTINGS = {
         img_idx_to_prompt=lambda idx: "",
         auto_cls=AutoModelForImageTextToText,
         vllm_output_post_proc=model_utils.blip2_vllm_to_hf_output,
+        # FIXME: https://github.com/huggingface/transformers/pull/38510
+        marks=[pytest.mark.skip("Model is broken")],
     ),
     "chameleon": VLMTestInfo(
         models=["facebook/chameleon-7b"],
@@ -281,10 +285,10 @@ VLM_TEST_SETTINGS = {
         multi_image_prompt="<start_of_image><start_of_image>Describe the two images in detail.",  # noqa: E501
         max_model_len=4096,
         max_num_seqs=2,
-        dtype="bfloat16",
         auto_cls=AutoModelForImageTextToText,
         vllm_runner_kwargs={"mm_processor_kwargs": {"do_pan_and_scan": True}},
         patch_hf_runner=model_utils.gemma3_patch_hf_runner,
+        num_logprobs=10,
     ),
     "glm4v": VLMTestInfo(
         models=["THUDM/glm-4v-9b"],
@@ -304,6 +308,34 @@ VLM_TEST_SETTINGS = {
         max_tokens=8,
         num_logprobs=10,
         marks=[large_gpu_mark(min_gb=32)],
+    ),
+    "glm4_1v": VLMTestInfo(
+        models=["THUDM/GLM-4.1V-9B-Thinking"],
+        test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
+        prompt_formatter=lambda img_prompt: f"<|user|>\n{img_prompt}<|assistant|>",  # noqa: E501
+        img_idx_to_prompt=lambda idx: "<|begin_of_image|><|image|><|end_of_image|>", # noqa: E501
+        video_idx_to_prompt=lambda idx: "<|begin_of_video|><|video|><|end_of_video|>", # noqa: E501
+        max_model_len=2048,
+        max_num_seqs=2,
+        get_stop_token_ids=lambda tok: [151329, 151336, 151338],
+        num_logprobs=10,
+        image_size_factors=[(), (0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
+        auto_cls=AutoModelForImageTextToText,
+    ),
+    "glm4_1v-video": VLMTestInfo(
+        models=["THUDM/GLM-4.1V-9B-Thinking"],
+        # GLM4.1V require include video metadata for input
+        test_type=VLMTestType.CUSTOM_INPUTS,
+        max_model_len=4096,
+        max_num_seqs=2,
+        auto_cls=AutoModelForImageTextToText,
+        patch_hf_runner=model_utils.glm4_1v_patch_hf_runner,
+        custom_test_opts=[CustomTestOptions(
+            inputs=custom_inputs.video_with_metadata_glm4_1v(),
+            limit_mm_per_prompt={"video": 1},
+        )],
+        # This is needed to run on machine with 24GB VRAM
+        vllm_runner_kwargs={"gpu_memory_utilization": 0.95},
     ),
     "h2ovl": VLMTestInfo(
         models = [
@@ -337,7 +369,8 @@ VLM_TEST_SETTINGS = {
         models=[
             "OpenGVLab/InternVL2-1B",
             "OpenGVLab/InternVL2-2B",
-            "OpenGVLab/Mono-InternVL-2B",
+            # FIXME: Config cannot be loaded in transformers 4.52
+            # "OpenGVLab/Mono-InternVL-2B",
         ],
         test_type=(VLMTestType.IMAGE, VLMTestType.MULTI_IMAGE),
         prompt_formatter=lambda img_prompt: f"<|im_start|>User\n{img_prompt}<|im_end|>\n<|im_start|>Assistant\n", # noqa: E501
@@ -568,6 +601,8 @@ VLM_TEST_SETTINGS = {
         max_num_seqs=2,
         vllm_output_post_proc=model_utils.qwen_vllm_to_hf_output,
         prompt_path_encoder=model_utils.qwen_prompt_path_encoder,
+        # FIXME: https://github.com/huggingface/transformers/issues/38358
+        marks=[pytest.mark.skip("Model initialization fails")],
     ),
     "qwen2_vl": VLMTestInfo(
         models=["Qwen/Qwen2-VL-2B-Instruct"],
